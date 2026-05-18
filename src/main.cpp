@@ -10,7 +10,7 @@ constexpr uint8_t A3_PIN = A3;
 
 // Helper: set both pins of a bridge
 inline void bridge1(uint8_t a, uint8_t b)
-{1
+{
     digitalWrite(A0_PIN, a);
     digitalWrite(A1_PIN, b);
 }
