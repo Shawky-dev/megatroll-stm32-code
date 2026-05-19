@@ -1,142 +1,140 @@
 #include <Arduino.h>
 
-// Bridge 1 — left wheel
-constexpr uint8_t A0_PIN = A0;
-constexpr uint8_t A1_PIN = A1;
-constexpr uint8_t PWM_LEFT_PIN = PB6; // PWM capable pin (change based on your board)
+// ─── Pin Definitions ──────────────────────────────────────────────────────────
+// H-Bridge 1 — left wheel
+constexpr uint8_t IN1_PIN = PA0;      // Direction A
+constexpr uint8_t IN2_PIN = PA1;      // Direction B
+constexpr uint8_t PWM_LEFT_PIN = PB6; // Must be PWM-capable
 
-// Bridge 2 — right wheel
-constexpr uint8_t A2_PIN = A2;
-constexpr uint8_t A3_PIN = A3;
-constexpr uint8_t PWM_RIGHT_PIN = PB7; // PWM capable pin (change based on your board)
+// H-Bridge 2 — right wheel
+constexpr uint8_t IN3_PIN = PA2;       // Direction A
+constexpr uint8_t IN4_PIN = PA3;       // Direction B
+constexpr uint8_t PWM_RIGHT_PIN = PB7; // Must be PWM-capable
 
-// Protocol constants
+// ─── Protocol ─────────────────────────────────────────────────────────────────
+// Frame: [0xAA] [0x55] [L_lo] [L_hi] [R_lo] [R_hi]
+// Left/Right PWM are signed 16-bit little-endian, range -100 to +100
 constexpr uint8_t HEADER1 = 0xAA;
 constexpr uint8_t HEADER2 = 0x55;
-constexpr uint8_t MSG_SIZE = 6; // 2 header + 2*2 bytes for PWM values
+constexpr uint8_t MSG_SIZE = 6;
+constexpr uint32_t BAUD_RATE = 115200;
 
-// Motor state
-int16_t left_pwm = 0;
-int16_t right_pwm = 0;
+// ─── Watchdog ─────────────────────────────────────────────────────────────────
+constexpr uint32_t WATCHDOG_MS = 500; // Stop motors if silent for 500 ms
 
-// Helper: set motor direction and PWM
-inline void setLeftMotor(int16_t pwm)
+// ─── State ────────────────────────────────────────────────────────────────────
+static uint8_t rx_buf[MSG_SIZE];
+static uint8_t rx_idx = 0;
+static uint32_t last_cmd_time = 0;
+static bool motors_active = false;
+
+// ─── Motor Driver ─────────────────────────────────────────────────────────────
+// pwm: -100 (full reverse) … 0 (stop) … +100 (full forward)
+static void setMotor(uint8_t pinA, uint8_t pinB, uint8_t pwmPin, int16_t pwm)
 {
+    // Clamp input
+    if (pwm > 100)
+        pwm = 100;
+    if (pwm < -100)
+        pwm = -100;
+
+    // Map magnitude 0-100 → 0-255
+    uint8_t duty = (uint8_t)((uint32_t)abs(pwm) * 255 / 100);
+
     if (pwm > 0)
     {
-        digitalWrite(A0_PIN, HIGH);
-        digitalWrite(A1_PIN, LOW);
-        analogWrite(PWM_LEFT_PIN, abs(pwm) * 2.55); // Scale -100..100 to 0..255
+        digitalWrite(pinA, HIGH);
+        digitalWrite(pinB, LOW);
     }
     else if (pwm < 0)
     {
-        digitalWrite(A0_PIN, LOW);
-        digitalWrite(A1_PIN, HIGH);
-        analogWrite(PWM_LEFT_PIN, abs(pwm) * 2.55);
+        digitalWrite(pinA, LOW);
+        digitalWrite(pinB, HIGH);
     }
     else
     {
-        digitalWrite(A0_PIN, LOW);
-        digitalWrite(A1_PIN, LOW);
-        analogWrite(PWM_LEFT_PIN, 0);
+        // Active brake: both LOW, PWM = 0
+        digitalWrite(pinA, LOW);
+        digitalWrite(pinB, LOW);
+        duty = 0;
     }
+
+    analogWrite(pwmPin, duty);
 }
 
-inline void setRightMotor(int16_t pwm)
+static inline void stopAll()
 {
-    if (pwm > 0)
-    {
-        digitalWrite(A2_PIN, HIGH);
-        digitalWrite(A3_PIN, LOW);
-        analogWrite(PWM_RIGHT_PIN, abs(pwm) * 2.55);
-    }
-    else if (pwm < 0)
-    {
-        digitalWrite(A2_PIN, LOW);
-        digitalWrite(A3_PIN, HIGH);
-        analogWrite(PWM_RIGHT_PIN, abs(pwm) * 2.55);
-    }
-    else
-    {
-        digitalWrite(A2_PIN, LOW);
-        digitalWrite(A3_PIN, LOW);
-        analogWrite(PWM_RIGHT_PIN, 0);
-    }
-}
-
-void setup()
-{
-    // Direction pins
-    pinMode(A0_PIN, OUTPUT);
-    pinMode(A1_PIN, OUTPUT);
-    pinMode(A2_PIN, OUTPUT);
-    pinMode(A3_PIN, OUTPUT);
-
-    // PWM pins
-    pinMode(PWM_LEFT_PIN, OUTPUT);
-    pinMode(PWM_RIGHT_PIN, OUTPUT);
-
-    // Initialize motors to stopped
-    setLeftMotor(0);
-    setRightMotor(0);
-
-    Serial1.begin(115200);
-
-    // LED indicator for connection status
-    pinMode(LED_BUILTIN, OUTPUT);
+    setMotor(IN1_PIN, IN2_PIN, PWM_LEFT_PIN, 0);
+    setMotor(IN3_PIN, IN4_PIN, PWM_RIGHT_PIN, 0);
+    motors_active = false;
     digitalWrite(LED_BUILTIN, LOW);
 }
 
+// ─── Setup ────────────────────────────────────────────────────────────────────
+void setup()
+{
+    pinMode(IN1_PIN, OUTPUT);
+    pinMode(IN2_PIN, OUTPUT);
+    pinMode(IN3_PIN, OUTPUT);
+    pinMode(IN4_PIN, OUTPUT);
+    pinMode(PWM_LEFT_PIN, OUTPUT);
+    pinMode(PWM_RIGHT_PIN, OUTPUT);
+    pinMode(LED_BUILTIN, OUTPUT);
+
+    stopAll();
+
+    Serial1.begin(BAUD_RATE);
+
+    last_cmd_time = millis();
+}
+
+// ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop()
 {
-    static uint8_t buffer[MSG_SIZE];
-    static uint8_t idx = 0;
-
+    // ── Packet parser ───────────────────────────────────────────────────────
     while (Serial1.available())
     {
-        uint8_t c = Serial1.read();
+        uint8_t c = (uint8_t)Serial1.read();
 
-        // Look for header
-        if (idx == 0 && c != HEADER1)
+        switch (rx_idx)
         {
-            continue;
-        }
-        if (idx == 1 && c != HEADER2)
-        {
-            idx = 0;
-            continue;
-        }
+        case 0:
+            if (c == HEADER1)
+                rx_idx = 1;
+            break;
 
-        buffer[idx++] = c;
+        case 1:
+            if (c == HEADER2)
+                rx_idx = 2;
+            else
+                rx_idx = 0; // restart search
+            break;
 
-        // Check if complete message received
-        if (idx == MSG_SIZE)
-        {
-            // Parse PWM values (little-endian signed 16-bit)
-            left_pwm = (int16_t)((buffer[3] << 8) | buffer[2]);
-            right_pwm = (int16_t)((buffer[5] << 8) | buffer[4]);
+        default:
+            rx_buf[rx_idx++] = c;
 
-            // Apply motor commands
-            setLeftMotor(left_pwm);
-            setRightMotor(right_pwm);
+            if (rx_idx == MSG_SIZE)
+            {
+                // Reconstruct signed 16-bit little-endian values
+                int16_t left_pwm = (int16_t)((uint16_t)rx_buf[3] << 8 | rx_buf[2]);
+                int16_t right_pwm = (int16_t)((uint16_t)rx_buf[5] << 8 | rx_buf[4]);
 
-            // Turn on LED to show active connection
-            digitalWrite(LED_BUILTIN, HIGH);
+                setMotor(IN1_PIN, IN2_PIN, PWM_LEFT_PIN, left_pwm);
+                setMotor(IN3_PIN, IN4_PIN, PWM_RIGHT_PIN, right_pwm);
 
-            idx = 0;
+                last_cmd_time = millis();
+                motors_active = true;
+                digitalWrite(LED_BUILTIN, HIGH);
+
+                rx_idx = 0;
+            }
+            break;
         }
     }
 
-    // Watchdog - stop motors if no command for 1 second
-    static unsigned long last_cmd_time = millis();
-    if (idx > 0)
+    // ── Watchdog ────────────────────────────────────────────────────────────
+    if (motors_active && (millis() - last_cmd_time > WATCHDOG_MS))
     {
-        last_cmd_time = millis();
-    }
-    else if (millis() - last_cmd_time > 1000)
-    {
-        setLeftMotor(0);
-        setRightMotor(0);
-        digitalWrite(LED_BUILTIN, LOW); // Turn off LED when stopped
+        stopAll();
     }
 }
